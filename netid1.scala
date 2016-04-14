@@ -14,10 +14,13 @@ object NetIdAllInOne {
            val nim=new netidManager()
          //  val conf=new SparkConf().setAppName("netidstep1bak").setMaster("local")
            val conf=new SparkConf().setAppName("NetAllInOne")
-
+       //改进一：I/O制度中的压缩配置方式，节约空间，获得时间上效率的提高
+          conf.getBoolean("spark.broadcast.compress", true)
+           conf.set("spark.broadcast.compress", "true")
+           
            val sc=new SparkContext(conf)
           // val textFile=sc.textFile("/home/chensha/stephanie/output_data/NetIdAllInOne/testData")
-           val textFile=sc.textFile(args(0),4)
+           val textFile=sc.textFile(args(0),250) //针对数据量为37.6GB的数据，分区为200或者250即可
 
            val iterations=5
            val step1rdd1=textFile.map(
@@ -29,8 +32,8 @@ object NetIdAllInOne {
                     value=nim.getStrNetIdType + "," + nim.getStrNetId;
                   }
                    (key,value)
-               }).reduceByKey(_+";"+_).cache
-               
+               }).partitionBy(new org.apache.spark.HashPartitioner(200)).reduceByKey(_+";"+_).cache
+            //改进二：partitionBy函数，参见pageRank的改进方法而来   
            val step1rdd2=textFile.map(
              line=>{
                var key=""
@@ -40,7 +43,7 @@ object NetIdAllInOne {
                  value=nim.getStrMac();
                }
                  (key,value)
-           }).cache
+           }).partitionBy(new org.apache.spark.HashPartitioner(200)).cache
            val step1rdd3=textFile.map(
              line=>{
                var key="";
@@ -50,7 +53,7 @@ object NetIdAllInOne {
                  value=line;
                }
                  (key,value)
-           }).cache
+           }).partitionBy(new org.apache.spark.HashPartitioner(200)).cache
            //过滤出虚拟身份数在2-40的行
           val step2rdd1=step1rdd1.filter(line=>{val lines=line._2.split(";").distinct;lines.length>=2&&lines.length<=40})
       
@@ -111,7 +114,7 @@ object NetIdAllInOne {
                       .map(x=>
                         {val strings=x.split(";");
                         (1,strings(0)+" "+strings(1))
-                        }).values
+                        }).partitionBy(new org.apache.spark.HashPartitioner(200)).values.cache
            
          //循环5次身份关联结果收敛
            var stp8rdd1=stp7rdd2
