@@ -1,5 +1,4 @@
 package learnspark
-
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
 import org.apache.spark.SparkConf
@@ -9,19 +8,19 @@ import utils.netidPara
 import java.util.ArrayList
 import scala.collection.mutable.ArrayBuffer
 
-object NetIdAllInOne {
+object NetId {
        def main(args:Array[String])={
            val nim=new netidManager()
-         //  val conf=new SparkConf().setAppName("netidstep1bak").setMaster("local")
-           val conf=new SparkConf().setAppName("NetAllInOne")
+           //val conf=new SparkConf().setAppName("NetIdAllInOne").setMaster("local")
+           val conf=new SparkConf().setAppName("NetIdAllInOne")
        //改进一：I/O制度中的压缩配置方式，节约空间，获得时间上效率的提高
-          conf.getBoolean("spark.broadcast.compress", true)
-           conf.set("spark.broadcast.compress", "true")
+          conf.getBoolean("spark.broadcast.compress", true);
+           conf.set("spark.broadcast.compress", "true");
            
            val sc=new SparkContext(conf)
-          // val textFile=sc.textFile("/home/chensha/stephanie/output_data/NetIdAllInOne/testData")
-           val textFile=sc.textFile(args(0),250) //针对数据量为37.6GB的数据，分区为200或者250即可
-
+          // val textFile=sc.textFile("/home/chensha/stephanie/output_data/NetIdAllInOne/testData",4)
+           //val textFile=sc.textFile(args(0),40)
+           val textFile=sc.textFile(args(0),500)
            val iterations=5
            val step1rdd1=textFile.map(
                 line=>{
@@ -32,8 +31,11 @@ object NetIdAllInOne {
                     value=nim.getStrNetIdType + "," + nim.getStrNetId;
                   }
                    (key,value)
-               }).partitionBy(new org.apache.spark.HashPartitioner(200)).reduceByKey(_+";"+_).cache
-            //改进二：partitionBy函数，参见pageRank的改进方法而来   
+               }).reduceByKey(_+";"+_).cache //根据webUI的各个stage状态区分shuffle1
+                //或者//.reduceByKey(_+_).coalesce(10, false).cache
+           //step1rdd1.saveAsTextFile(args(0))    
+          //改进二：partitionBy，从pageRank优化思路得来的想法。想法2：对RDD的分区重新划分，repartition和coalesce函数。以及mapPartitions函数。     
+              // val step1rdd1=textFile.mapPartitions(myfuncgetString).reduceByKey(_+";"+_,100).cache
            val step1rdd2=textFile.map(
              line=>{
                var key=""
@@ -43,7 +45,7 @@ object NetIdAllInOne {
                  value=nim.getStrMac();
                }
                  (key,value)
-           }).partitionBy(new org.apache.spark.HashPartitioner(200)).cache
+           }).cache
            val step1rdd3=textFile.map(
              line=>{
                var key="";
@@ -53,14 +55,14 @@ object NetIdAllInOne {
                  value=line;
                }
                  (key,value)
-           }).partitionBy(new org.apache.spark.HashPartitioner(200)).cache
+           }).cache
            //过滤出虚拟身份数在2-40的行
           val step2rdd1=step1rdd1.filter(line=>{val lines=line._2.split(";").distinct;lines.length>=2&&lines.length<=40})
       
           
           //计算每个身份的总出现次数，即输出netIdType,netId count
           val getvalues=step2rdd1.values
-          val countone2=getvalues.flatMap(_.split(";").distinct).map(word=>(word,1)).reduceByKey(_+_)
+          val countone2=getvalues.flatMap(_.split(";").distinct).map(word=>(word,1)).reduceByKey(_+_) //shuffle2
          
           //计算身份对出现的次数,即输出netIdType,netId1 netIdType,netId2 count
           val countpairs=getvalues.map(_.split(";").distinct).
@@ -70,19 +72,19 @@ object NetIdAllInOne {
                                   for(i<-0 until x.length;from=i+1;j<-from until x.length if (x(i).compareTo(x(j))<0))  
                                        yield (x(j)+";"+x(i))
                                                     }
-                                   }.flatMap(_.toList).map(x=>(x,1)).reduceByKey(_+_)
+                                   }.flatMap(_.toList).map(x=>(x,1)).reduceByKey(_+_) //shuffle3
 
            //并入netIdType,netId1 countid1                       
-          val stp4rdd3=countpairs.keyBy(_._1.split(";").apply(0)).join(countone2).values
+          val stp4rdd3=countpairs.keyBy(_._1.split(";").apply(0)).join(countone2).values //shuffle4
         
-          //并入netIdType,netId2 countid2，写法稍微改变但是效果一致
-          val stp5rdd1=stp4rdd3.keyBy(x=>{
+          //并入netIdType,netId2 countid2
+          val stp5rdd1=stp4rdd3.keyBy(x=>{ //shuffle5
                 val arr=x._1._1.split(";")
                 if(arr.length==2) arr(1)
                 else null})//??
           val stp5rdd3=stp5rdd1.join(countone2).values 
           //stp5rdd3.saveAsTextFile("/home/chensha/stephanie/output_data/NetIdAllInOne/2.1")
-          stp5rdd3.saveAsTextFile(args(1))
+          //stp5rdd3.saveAsTextFile(args(1))
 
           //输出形式为(((netidtype,netid1;netidtype,netid2 pairscount), netid1count), netid2count)例如(((101,429196908;101,1670241331,6),7),1)
           
@@ -114,13 +116,13 @@ object NetIdAllInOne {
                       .map(x=>
                         {val strings=x.split(";");
                         (1,strings(0)+" "+strings(1))
-                        }).partitionBy(new org.apache.spark.HashPartitioner(200)).values.cache
+                        }).values
            
          //循环5次身份关联结果收敛
            var stp8rdd1=stp7rdd2
            var linestring:Array[String]=Array()
            for(i<-1 to iterations){
-               val rddmap_1temp=stp8rdd1.flatMap(line=>{
+               val rddmap_1temp=stp8rdd1.flatMap(line=>{ //for循环里面shuffle6-10
                var array=new ArrayBuffer[(String,String)]();
                val str=line.split(" ");
                for(i<-0 until str.length){
@@ -130,13 +132,14 @@ object NetIdAllInOne {
              })
            stp8rdd1=rddmap_1temp.reduceByKey(_+" "+_).mapValues(_.split(" ").distinct.mkString(" ")).values
            }
-         val stp8red1=stp8rdd1.toArray.distinct
-         val stp8result=sc.makeRDD(stp8red1)
+         val stp8red1=stp8rdd1.toArray.distinct //shuffle11
+         val stp8result=sc.makeRDD(stp8red1,50)
+         stp8result.saveAsTextFile(args(1))
 
           // 输入:原始数据和step8的数据
           // 找出结果中虚拟身份数大于20的虚拟身份对应的MAC,疑似NAT;
           // 输出：MAC   
-           val stp9rdd1=stp8result.filter(_.split(" ").length>=20)
+          val stp9rdd1=stp8result.filter(_.split(" ").length>=20)
           // stp9rdd1.saveAsTextFile("/home/chensha/stephanie/output_data/netids1.3.21")
            val stp9rdd2=stp9rdd1.flatMap(line=>{
                 val x=line.split(" ");
@@ -154,8 +157,23 @@ object NetIdAllInOne {
            val stp10rdd1=stp9rdd4.toArray.distinct //输出去重后的疑似NAT
            val stp10rdd2=step1rdd3.filter(line=>stp10rdd1.contains(line._1))
            val stp10rdd3=step1rdd3.subtract(stp10rdd2).values
-          // stp10rdd3.saveAsTextFile("/home/chensha/stephanie/output_data/NetIdAllInOne/2.2")
+           //stp10rdd3.saveAsTextFile("/home/chensha/stephanie/output_data/NetIdAllInOne/2.3")
             stp10rdd3.saveAsTextFile(args(2))
 
      }
+    def myfuncgetString(iter:Iterator[String]):Iterator[(String,String)]={ 
+           val nim=new netidManager()
+           var res=List[(String,String)]()
+      while(iter.hasNext){
+                 var key="";
+                 var value="";
+                 if(nim.isLegalData(iter.next)){
+                    key=nim.getStrQztId + "," + nim.getStrMac + "," + nim.getHourTime;
+                    value=nim.getStrNetIdType + "," + nim.getStrNetId;
+                  }
+                 res.::=(key,value)
+     }
+     res.iterator
+   }
 }
+
