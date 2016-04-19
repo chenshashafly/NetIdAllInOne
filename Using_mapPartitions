@@ -1,0 +1,59 @@
+package learnspark
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import scala.collection.JavaConversions._
+import utils.netidManager
+import utils.netidPara
+import java.util.ArrayList
+import scala.collection.mutable.ArrayBuffer
+
+object netids1{
+  def main(args:Array[String])={
+
+        val nim=new netidManager()
+           //val conf=new SparkConf().setAppName("NetIdAllInOne").setMaster("local")
+          val conf=new SparkConf().setAppName("TestS2")
+           //改进一：I/O制度中的压缩配置方式，节约空间，获得时间上效率的提高
+           //conf.getBoolean("spark.broadcast.compress", true);
+          // conf.set("spark.broadcast.compress", "true");
+          
+           val sc=new SparkContext(conf)
+           val textFile=sc.textFile(args(0),50)
+           
+
+             
+          /*val step1rdd1=textFile.map(
+                line=>{
+                 var key="";
+                 var value="";
+                 if(nim.isLegalData(line)){
+                    key=nim.getStrQztId + "," + nim.getStrMac + "," + nim.getHourTime;
+                    value=nim.getStrNetIdType + "," + nim.getStrNetId;
+                  }
+                   (key,value)
+               })*/
+               val step1rdd1=textFile.mapPartitions(myfuncgetString)
+               val step1rdd2=step1rdd1.reduceByKey(_+";"+_,10)
+               //.partitionBy(new org.apache.spark.HashPartitioner(10)).cache
+               //或者//.reduceByKey(_+_).coalesce(10, false).cache
+              
+              step1rdd2.saveAsTextFile(args(1))    
+  }
+ def myfuncgetString(iter:Iterator[String]):Iterator[(String,String)]={ 
+   val nim=new netidManager()
+   var res=List[(String,String)]()
+      while(iter.hasNext){
+                 var key="";
+                 var value="";
+                 if(nim.isLegalData(iter.next)){
+                    key=nim.getStrQztId + "," + nim.getStrMac + "," + nim.getHourTime;
+                    value=nim.getStrNetIdType + "," + nim.getStrNetId;
+                  }
+                 res.::=(key,value)
+     }
+     res.iterator
+   }
+
+}
