@@ -1,0 +1,275 @@
+package qqemail
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import scala.collection.JavaConversions._
+import java.util.ArrayList
+import scala.collection.mutable.ArrayBuffer
+import scala.util.matching._
+import org.apache.spark.HashPartitioner
+//V1是以(qztid ip mac)为key值，但是在计算每个id出现在哪些key值上时，发现绝大部分的qztid+mac是相同的，只有ip不同，所以ip是否需要出现在这个key值里？
+//V2是以（qztid mac）为key值来计算的。
+//少了ip字段的限制，预计NAT数目会变多，而invalid数目则会变少，（如一个id本来出现在4个(qztid ip mac)上，却只出现在2个（qztid mac）上），
+//使得有些id不能被计入无效名单中。
+object getQEnt_v2 {
+    def main(args:Array[String])={
+      //val conf=new SparkConf().setAppName("getQEnt").setMaster("local")
+      val conf=new SparkConf().setAppName("getQEnt_v2")
+      val sc=new SparkContext(conf)
+      
+      //im分析
+      val im = sc.textFile(args(0))
+      val filterIm = im.filter { x =>
+       {
+        var result = false
+        val parts = x.split("\t")
+        if (parts.length == 19 || parts.length == 22) { //两种长度19/22的字段，8号1002为QQ记录，1009为手机号码；
+          if (parts(7).equals("1002")) {   
+            if (parts(10).length() >= 5 || parts(10).length() <= 11) {              //QQ号长度为5到11，
+              val regEx = "[0-9]+".r //正则表达式表示QQ号
+              val someQQ = regEx.findFirstIn(parts(10)).toString  //findFirstIn找到字符串中的首个匹配项,即只匹配第一个符合正则的字符串就停止了。
+              if (someQQ.length() >= 11) {
+                if (someQQ.substring(5, someQQ.length() - 1).equals(parts(10))) { //?为什么不加这个regex会出错呢？
+                  result = true
+                }
+              }
+            }
+          }
+        }
+        result
+      }
+    }
+       val keyIm=filterIm.map { x =>  //0/5/6/4/7/10号字段分别表示qztid/ip/mac/time/type(1002/1009分别代表pc/手机端)/qqaccount
+      {
+        val parts = x.split("\t")
+        val time = parts(4).toLong  //如：time=1444579324；day=1444579200
+        //parts(0).toInt + "\t" + parts(5) + "\t" + parts(6) + "\t" + parts(7) + "\t" + parts(10) //+ "\tendMark"
+        parts(0).toInt + "\t" + parts(6) + "\t" + parts(7) + "\t" + parts(10)
+      }
+    }
+       val reduceIm=keyIm.distinct.map { x => 
+      {
+        val parts = x.split("\t")
+        //"length:"+parts.length
+        //(parts(0) + "\t" + parts(1) + "\t" + parts(2), parts(3) + "\t" + parts(4))
+        (parts(0) + "\t" + parts(1) , parts(2) + "\t" + parts(3))
+      }
+    }.reduceByKey(_ + ";" + _)
+    
+    //第0部分，计算每个imid出现在多少个不同（qztid ip mac）下，如果某个imid出现在不同行的次数大于等于3次则将此imid计入无效名单内，用于过滤
+    //getim的结果为(1,(1002	3221578737,2004219	3232252306	FF:FF:FF:FF:FF:FF))，其中1指的是后面的imid只出现于一个（qztid ip mac）
+    //sortimid格式为(1,(7,1002	413212375))，其中7代表imid出现在了7个不同的（qztid ip mac），相同情况的imid总共只有一个。
+    //getinvalimid将所有无效imid放入一个数组中，用于过滤。
+    val getimid=keyIm.distinct.map(x=>{
+      val parts=x.split("\t");
+       //(parts(3)+"\t"+parts(4),parts(0)+"\t"+parts(1)+"\t"+parts(2))
+       (parts(2)+"\t"+parts(3),parts(0)+"\t"+parts(1))
+    }).reduceByKey(_+";"+_).map(x=>{
+      val parts=x._2.split(";")
+      (parts.length,x)
+    }).sortByKey(false)
+    val countimid=getimid.map(x=>(x._1,x._2._1)).reduceByKey(_+";"+_)
+    val sortimid=countimid.map(x=>{
+      val parts=x._2.split(";")
+      (parts.length,x)
+    }).sortByKey(false)
+    
+    val getinvalimid=sortimid.filter(x=>x._2._1>=3).map(x=>x._2._2)
+     getimid.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(1))
+     sortimid.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(2))
+     getinvalimid.distinct.coalesce(1, false).saveAsTextFile(args(3))
+
+    //第一部分，不加时间字段的限制下获得imNAT
+    //计算每一行身份的个数。
+     val countqqids=reduceIm.map{line=>{
+          val strs=line._2.split(";")
+          (strs.length,1)
+     		}}.reduceByKey(_+_)
+     countqqids.partitionBy(new HashPartitioner(1)).saveAsTextFile(args(4))
+    //获取imNAT，所获得数据可以存储到HBASE数据库中，然后根据MAC地址查询是否为NAT。
+     	val getimNAT=reduceIm.filter{
+     		case (key,value)=>{
+     		var result=false; 
+     		val strlen=value.split(";").length
+     		if(strlen>5){result=true}    //把出现过5个以上的qq号码的mac地址记为疑似NAT
+              result
+           }}.map(x=>{
+              val strs=x._1.split("\t")
+              (strs(1))
+      })
+       getimNAT.distinct.coalesce(1, false).saveAsTextFile(args(5))
+     
+      //有些时间字段格式不对需要将其过滤掉，如有的time为1445238238675，超出了范围error：java.lang.NumberFormatException)
+     //第二部分，首先，过滤掉MAC后，加入时间得到高可信度的KV对。  再过滤掉无效imid。
+     val imNAT=getimNAT.toArray
+     val invalimid=getinvalimid.toArray
+     val filterinvalim=keyIm.distinct.map { x => 
+      {
+        val parts = x.split("\t")
+        //"length:"+parts.length
+        (parts(0) + "\t" + parts(1) , parts(2) + "\t" + parts(3))
+      }
+    }.filter{
+      case (key,value) => {
+        var result=true
+        if(invalimid.contains(value)){result=false}
+        result
+      }
+    }
+     val filterNATim=filterinvalim.filter{
+         case (key,value) => {
+           var result=true
+           val arrays=key.split("\t")
+           val macaddr=arrays(1)
+           if(imNAT.contains(macaddr)){result=false}
+           result
+           }}
+     val filterreduceim=filterNATim.reduceByKey(_ + ";" + _)
+     filterreduceim.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(6))
+     val imresult=filterreduceim.filter {
+          case (key, value) => {
+            var result = false
+            val parts = value.split(";")
+            if (parts.length <= 2) {   //过滤一行身份数大于2的行
+            result = true
+          }
+         result
+       }
+     }
+     imresult.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(7))
+     //imresult.saveAsTextFile(args(1))
+    
+     
+     
+     
+     //email分析
+      val email = sc.textFile(args(5))
+       val filteremail=email.filter { x =>
+       {
+        var result = false
+        val parts = x.split("\t")
+        if (parts.length == 27 || parts.length == 30) { //长度为27/30，8为actionType
+          val actionType = parts(7).toInt
+          //0/发,1/收,2/web发
+          if (actionType == 0 || actionType == 2) {  //只get发信人的邮箱帐号
+            result = true
+          }
+        }
+        result
+      }}
+        
+       val keyEmail = filteremail.map { x =>      //0/5/6/4/9号分别代表qztid/ip/mac/time（以day为单位）/邮箱帐号emailaccount
+         {
+        val parts = x.split("\t")
+        val time = parts(4).toLong
+       // parts(0).toInt + "\t" + parts(5) + "\t" + parts(6) + "\t9\t" + parts(9).toLowerCase()  //不加时间的限制可以剔除某些身份出现太多的mac，认为是疑似NAT
+         parts(0).toInt + "\t" + parts(6) + "\t9\t" + parts(9).toLowerCase()
+      }
+    }.distinct.map { x =>  //去重
+       {
+        val parts = x.split("\t")
+        (parts(0) + "\t" + parts(1) , parts(2) + "\t" + parts(3))
+      }
+    }
+    val reducekeyEmail=keyEmail.reduceByKey(_ + ";" + _)
+    
+    //第0部分：得到invalemailid,emailid出现在3个及以上的不同（qztid  mac）下时将其列入无效名单。
+    val getemailid=filteremail.map { x =>      //0/5/6/4/9号分别代表qztid/ip/mac/time（以day为单位）/邮箱帐号emailaccount
+         {
+        val parts = x.split("\t")
+        val time = parts(4).toLong
+        //parts(0).toInt + "\t" + parts(5) + "\t" + parts(6) + "\t9\t" + parts(9).toLowerCase()  //不加时间的限制可以剔除某些身份出现太多的mac，认为是疑似NAT
+        parts(0).toInt + "\t" + parts(6) + "\t9\t" + parts(9).toLowerCase()
+      }
+     }.distinct.map(x=>{
+        val parts=x.split("\t");
+       (parts(2)+"\t"+parts(3),parts(0)+"\t"+parts(1))
+    }).reduceByKey(_+";"+_).map(x=>{
+      val parts=x._2.split(";")
+      (parts.length,x)
+    }).sortByKey(false)  
+    getemailid.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(8))
+    val countemid=getemailid.map(x=>(x._1,x._2._1)).reduceByKey(_+";"+_)
+    val sortemid=countemid.map(x=>{
+      val parts=x._2.split(";")
+      (parts.length,x)
+    })
+    sortemid.sortByKey(false).partitionBy(new HashPartitioner(5)).saveAsTextFile(args(9))
+    val getinvalemid=sortemid.filter(x=>x._2._1>=3).map(x=>x._2._2)
+    getinvalemid.distinct.coalesce(1, false).saveAsTextFile(args(10))
+    
+    //第一部分：不加时间字段的限制下提取emNAT
+      //计算每一行身份的个数。
+     val countemailids=reducekeyEmail.map{line=>{
+          val strs=line._2.split(";")
+          (strs.length,1)
+        }}.reduceByKey(_+_)
+     countemailids.partitionBy(new HashPartitioner(1)).saveAsTextFile(args(11))
+     //获取imNAT，所获得数据可以存储到HBASE数据库中，然后根据MAC地址查询是否为NAT。
+     val getemNAT=reducekeyEmail.filter{case (key,value)=>{
+        var result=false;
+        val valuelen=value.split(";").length
+        if(valuelen>4){result=true}
+          result
+       }}.map(x=>{
+        val info=x._1.split("\t")
+        info(2)
+       })
+    getemNAT.distinct.coalesce(1, false).saveAsTextFile(args(12))
+    
+    //第二部分,加入时间并且首先要过滤包含NAT的行,最后得到去除掉的具有高可信度的KV对， 
+    //过滤疑似NAT的行
+    val emNAT=getemNAT.toArray
+    val invalemid=getinvalemid.toArray
+    val filterinvalemid=keyEmail.filter{
+      case (key,value) => {
+        var result=true
+        if(invalemid.contains(value)){result=false}
+        result
+      }
+    }
+    val filterNATem=filterinvalemid.filter{    
+      case (key,value) => {
+        var result=true
+        val arrays=key.split("\t")
+        val macaddr=arrays(2)
+        if(emNAT.toArray.contains(macaddr)){result=false}
+        result
+    }}
+    val reduceNATem=filterNATem.reduceByKey(_+";"+_)
+    val emailres=reduceNATem.filter {   //由于一个人在企业里一般只有一个邮箱，因此过滤掉value里含有2个以上后缀相同的行。
+      case (key, value) => {      //注意：QQ邮箱可以有多个！
+        var result = true
+        val parts = value.split(";")
+        var emailFix = new ArrayBuffer[String]()
+        for (tmp <- parts) {
+          val emails = tmp.split("@")
+          if (!emailFix.contains(emails(1))) {  
+            emailFix += emails(1)
+          } else {
+            result = false
+          }
+        }
+        	  result
+      }
+    }
+
+   emailres.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(13))    
+    //emailres.saveAsTextFile(args(3))
+    //合并QEids
+    val unionQE=imresult.union(emailres)
+    val joinQE=imresult.join(emailres)
+    joinQE.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(14))
+    unionQE.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(15))
+    val getQE=unionQE.reduceByKey(_+";"+_)  
+    getQE.partitionBy(new HashPartitioner(5)).saveAsTextFile(args(16))
+    val countQEids=getQE.map(line=>{
+      val lines=line._2.split(";")
+      (line._1,line._2+"\t"+lines.length)
+    }).partitionBy(new HashPartitioner(5))
+   countQEids.saveAsTextFile(args(17))
+    
+    //接下来进行身份关联,对timerange为4和8的分别进行身份关联，考察得到的结果的不同：另起scala文件relateQEid
+    	}
+   }
